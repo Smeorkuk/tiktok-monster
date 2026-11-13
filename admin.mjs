@@ -1,7 +1,7 @@
-import {mountAppearance} from './appearance-editor.mjs?v=3.2.0';
-import {adminFetch,setAdminToken} from './config.mjs?v=3.2.0';
-import {mountModes} from './modes-editor.mjs?v=3.2.0';
-import {mountEditor} from './editor.mjs?v=3.2.0';
+import {mountAppearance} from './appearance-editor.mjs?v=3.3.0';
+import {adminFetch,setAdminToken} from './config.mjs?v=3.3.0';
+import {mountModes} from './modes-editor.mjs?v=3.3.0';
+import {mountEditor} from './editor.mjs?v=3.3.0';
 const root=document.querySelector('#admin');const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let query='',state='all',offset=0,total=0,items=[],requestId=0,detail=null;
 const date=t=>t?new Intl.DateTimeFormat('ru-RU',{dateStyle:'short',timeStyle:'short'}).format(t):'—';
