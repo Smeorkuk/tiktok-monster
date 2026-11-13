@@ -1,3 +1,4 @@
+import {normalizeAnswer,isCorrect,validAnswer} from '../web/answers.mjs';
 import {cmsRoutes,loadQuestions} from './cms.mjs';
 import bank from './bank.mjs';
 import assets from './assets.mjs';
@@ -33,7 +34,7 @@ async function authRoutes(req,env,path){
 function guest(req){const player=req.headers.get('x-player-token');if(/^[a-f0-9-]{36}$/.test(player||''))return player;return /(?:^|;\s*)tt_player=([a-f0-9-]{36})(?:;|$)/.exec(req.headers.get('cookie')||'')?.[1];}
 function summary(row){const {owner,question_ids,question_snapshot,answers,years,...rest}=row;return {...rest,years:JSON.parse(years)};}
 async function body(req){if(!req.headers.get('content-type')?.includes('application/json'))throw Error('Требуется JSON.');if(Number(req.headers.get('content-length')||0)>512000)throw Error('Запрос слишком большой.');const text=await req.text();if(text.length>512000)throw Error('Запрос слишком большой.');return JSON.parse(text);}
-function score(ids,answers,map=byId){let points=0,max=0,correct=0;for(const id of ids){const q=map.get(id);max+=q.level;if(answers[id]===q.answer){points+=q.level;correct++;}}return {points,max,correct,percent:Math.round(points/max*100),answered:Object.keys(answers).length};}
+function score(ids,answers,map=byId){let points=0,max=0,correct=0;for(const id of ids){const q=map.get(id);max+=q.level;if(isCorrect(q,answers[id])){points+=q.level;correct++;}}return {points,max,correct,percent:Math.round(points/max*100),answered:Object.keys(answers).length};}
 export async function handle(req,env){const url=new URL(req.url),p=url.pathname;const isAdmin=await admin(req,env);
  if(p==='/api/me')return json({isAdmin,tracking:true});
  if(p.startsWith('/api/')){
@@ -59,7 +60,7 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
    if(!answers||Array.isArray(answers)||typeof answers!=='object'||Object.keys(answers).some(id=>!ids.includes(id)))return error('Неверные ответы.');
    if(Object.entries(old).some(([id,a])=>answers[id]!==a))return error('Сохранённый ответ нельзя заменить.',409);
    const count=Object.keys(answers).length;if(!ids.slice(0,count).every(id=>Object.hasOwn(answers,id)))return error('Ответы должны идти по порядку.');
-   if(Object.entries(answers).some(([id,a])=>a!==null&&!map.get(id).options.includes(a)))return error('Неизвестный вариант ответа.');
+   if(Object.entries(answers).some(([id,a])=>!validAnswer(map.get(id),a)))return error('Неизвестный вариант ответа.');
    if(b.finished===true&&count!==ids.length)return error('Есть неотвеченные вопросы.');
    const s=score(ids,answers,map),finished=row.finished_at||(b.finished===true?Date.now():null);
    const result=await env.DB.prepare('UPDATE attempts SET answers=?,answered=?,correct=?,points=?,percent=?,updated_at=?,finished_at=?,revision=revision+1 WHERE id=? AND revision=?').bind(JSON.stringify(answers),s.answered,s.correct,s.points,s.percent,Date.now(),finished,row.id,row.revision).run();
@@ -80,7 +81,7 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
     const clause=where.join(' AND '),n=await env.DB.prepare('SELECT COUNT(*) n FROM attempts WHERE '+clause).bind(...args).first();
     const rows=await env.DB.prepare('SELECT * FROM attempts WHERE '+clause+' ORDER BY started_at DESC,id DESC LIMIT 30 OFFSET ?').bind(...args,offset).all();return json({items:rows.results.map(summary),total:n.n,offset});
    }
-   const detail=/^\/api\/admin\/attempts\/([a-f0-9-]{36})$/.exec(p);if(detail){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(detail[1]).first();if(!row)return error('Попытка не найдена.',404);const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const answers=JSON.parse(row.answers);return json({...summary(row),questions:JSON.parse(row.question_ids).map(id=>{const q=map.get(id);return {id,prompt:q.prompt,year:q.year,answer:q.answer,chosen:answers[id],answered:Object.hasOwn(answers,id),correct:answers[id]===q.answer,sources:q.sources};})});}
+   const detail=/^\/api\/admin\/attempts\/([a-f0-9-]{36})$/.exec(p);if(detail){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(detail[1]).first();if(!row)return error('Попытка не найдена.',404);const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const answers=JSON.parse(row.answers);return json({...summary(row),questions:JSON.parse(row.question_ids).map(id=>{const q=map.get(id);return {id,prompt:q.prompt,year:q.year,answer:q.answer,chosen:answers[id],answered:Object.hasOwn(answers,id),correct:isCorrect(q,answers[id]),sources:q.sources};})});}
    return error('Не найдено.',404);
   }
   return error('Не найдено.',404);
