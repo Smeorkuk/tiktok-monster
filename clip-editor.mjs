@@ -1,5 +1,5 @@
-import {mountQuestionMedia,stopQuestionMedia} from './question-media.mjs?v=3.3.0';
-import {adminFetch} from './config.mjs?v=3.3.0';
+import {mountQuestionMedia,stopQuestionMedia} from './question-media.mjs?v=3.4.0';
+import {adminFetch} from './config.mjs?v=3.4.0';
 
 export function mountClipEditor(host,initial,onChange,onBusy){
  let clip=initial,objectUrl=null,disposed=false,uploading=false,controller=null;
