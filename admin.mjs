@@ -1,6 +1,6 @@
-import {adminFetch,setAdminToken} from './config.mjs';
-import {mountModes} from './modes-editor.mjs';
-import {mountEditor} from './editor.mjs';
+import {adminFetch,setAdminToken} from './config.mjs?v=3.0.1';
+import {mountModes} from './modes-editor.mjs?v=3.0.1';
+import {mountEditor} from './editor.mjs?v=3.0.1';
 const root=document.querySelector('#admin');const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let query='',state='all',offset=0,total=0,items=[],requestId=0,detail=null;
 const date=t=>t?new Intl.DateTimeFormat('ru-RU',{dateStyle:'short',timeStyle:'short'}).format(t):'—';

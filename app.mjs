@@ -1,9 +1,9 @@
-import {loadAccount,getAccount,accountDialog} from './account.mjs';
+import {loadAccount,getAccount,accountDialog} from './account.mjs?v=3.0.1';
 const accountReady=loadAccount();
-import {defaultModes,modePool,modeCount} from './modes.mjs';
-import {normalizeAnswer,isCorrect} from './answers.mjs';
-import {apiFetch,adminUrl} from './config.mjs';
-import {createSession,validSession,scoreSession,rank} from './engine.mjs';
+import {defaultModes,modePool,modeCount} from './modes.mjs?v=3.0.1';
+import {normalizeAnswer,isCorrect} from './answers.mjs?v=3.0.1';
+import {apiFetch,adminUrl} from './config.mjs?v=3.0.1';
+import {createSession,validSession,scoreSession,rank} from './engine.mjs?v=3.0.1';
 const app=document.querySelector('#app'),dialog=document.querySelector('#dialog'),dialogContent=document.querySelector('#dialog-content');
 const SAVE='tt-monster-session-v1',PREF='tt-monster-prefs-v1';let catalog=[],bank=[],byId=new Map(),session=null,view='home',mode='big',modes=defaultModes,selectedYears=[2021,2022,2023,2024,2025,2026],reviewFilter='wrong',sound=false,audio=null;
 let syncRunning=false,syncDirty=false,syncState='idle';
