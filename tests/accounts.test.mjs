@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';import {createHash} from 'node:crypto';import worker from '../dist/server/index.js';import {database} from '../scripts/sqlite.mjs';
-const DB=database();for(const f of ['0000_attempts','0001_auth_rate','0002_question_editor','0003_modes','0004_accounts'])DB.exec(readFileSync('drizzle/'+f+'.sql','utf8'));const env={DB,LOCAL_DEV:true,ADMIN_EMAILS:'owner@test.invalid',FRONTEND_ORIGIN:'https://smeorkuk.github.io'};
+const DB=database();for(const f of ['0000_attempts','0001_auth_rate','0002_question_editor','0003_modes','0004_accounts','0005_security'])DB.exec(readFileSync('drizzle/'+f+'.sql','utf8'));const env={DB,LOCAL_DEV:true,ADMIN_EMAILS:'owner@test.invalid',FRONTEND_ORIGIN:'https://smeorkuk.github.io'};
 async function call(path,{method='GET',body,token,admin=false,ip='192.0.2.8',origin='https://quiz.test'}={}){const r=await worker.fetch(new Request('https://quiz.test'+path,{method,headers:{origin,'Content-Type':'application/json','cf-connecting-ip':ip,...(token?{'X-Account-Token':token}:{}),...(admin?{'oai-authenticated-user-email':'owner@test.invalid'}:{})},body:body?JSON.stringify(body):undefined}),env);return {status:r.status,data:await r.json()};}
 const password='local-test-password-83';let user,second,code,attempt;
 test('Аккаунт: уникальный ник, безопасная сессия, пароль и защита админки',async()=>{
@@ -13,20 +13,20 @@ test('Аккаунт: уникальный ник, безопасная сесс
  assert.equal((await call('/api/attempts',{method:'POST',body:{nickname:'ПоддельныйНик',consent:true,ids:['2021-001']}})).status,401);
 });
 test('Рейтинг: согласие, все годы, один лучший результат и корзина',async()=>{
- const bank=(await call('/api/questions')).data.questions;const modes=(await call('/api/modes')).data.modes;const mode=modes[0];const ids=bank.slice(0,mode.count).map(q=>q.id);const body={nickname:'ЧужойНик',modeId:mode.id,years:[2021,2022,2023,2024,2025,2026],ids,consent:true,publicConsent:true};
- let r=await call('/api/attempts',{method:'POST',token:user.token,body});assert.equal(r.status,201);attempt=r.data.id;
- const answers=Object.fromEntries(ids.map(id=>[id,bank.find(q=>q.id===id).answer]));assert.equal((await call('/api/attempts/'+attempt,{method:'PUT',token:user.token,body:{answers,finished:true}})).status,200);
+ const bank=JSON.parse(readFileSync('web/questions.json','utf8')),mode=(await call('/api/modes')).data.modes[0];
+ const body={nickname:'ЧужойНик',protocol:2,modeId:mode.id,years:[2021,2022,2023,2024,2025,2026],consent:true,publicConsent:true};
+ async function finish(extra={}){const r=await call('/api/attempts',{method:'POST',token:user.token,body:{...body,...extra}});assert.equal(r.status,201);const ids=r.data.questions.map(q=>q.id),answers=Object.fromEntries(ids.map(id=>[id,bank.find(q=>q.id===id).answer]));assert.equal((await call('/api/attempts/'+r.data.id,{method:'PUT',token:user.token,body:{answers,finished:true}})).status,200);return {id:r.data.id,answers};}
+ const first=await finish();attempt=first.id;
  assert.equal((await call('/api/admin/attempts/'+attempt,{admin:true})).data.nickname,'Игрок_Ёж');
  let board=await call('/api/leaderboard');assert.equal(board.data.items.length,1);assert.equal(board.data.items[0].percent,100);assert(!('account_id' in board.data.items[0]));assert(!('id' in board.data.items[0]));
- r=await call('/api/attempts',{method:'POST',token:user.token,body:{...body,publicConsent:false}});await call('/api/attempts/'+r.data.id,{method:'PUT',token:user.token,body:{answers,finished:true}});assert.equal((await call('/api/leaderboard')).data.items.length,1);
+ await finish({publicConsent:false});assert.equal((await call('/api/leaderboard')).data.items.length,1);
  assert.equal((await call('/api/admin/attempts/'+attempt,{method:'DELETE',token:user.token})).status,403);
  assert.equal((await call('/api/admin/attempts/'+attempt,{method:'DELETE',admin:true})).status,200);assert.equal((await call('/api/leaderboard')).data.items.length,0);
- assert.equal((await call('/api/attempts/'+attempt,{method:'PUT',token:user.token,body:{answers,finished:true}})).status,410);
+ assert.equal((await call('/api/attempts/'+attempt,{method:'PUT',token:user.token,body:{answers:first.answers,finished:true}})).status,410);
  assert.equal((await call('/api/admin/attempts?state=deleted',{admin:true})).data.total,1);
  await call('/api/admin/attempts/'+attempt+'/restore',{method:'POST',admin:true});assert.equal((await call('/api/leaderboard')).data.items.length,1);
- r=await call('/api/attempts',{method:'POST',token:user.token,body});await call('/api/attempts/'+r.data.id,{method:'PUT',token:user.token,body:{answers,finished:true}});assert.equal((await call('/api/leaderboard')).data.items.length,1);
- const opponent=(await call('/api/account/register',{method:'POST',body:{nickname:'OtherPlayer',password,consent:true},ip:'192.0.2.34'})).data;assert.equal((await call('/api/attempts/'+attempt,{method:'PUT',token:opponent.token,body:{answers,finished:true}})).status,404);
- // Changing a question starts a new comparable ranking; old attempts remain in private history.
+ await finish();assert.equal((await call('/api/leaderboard')).data.items.length,1);
+ const opponent=(await call('/api/account/register',{method:'POST',body:{nickname:'OtherPlayer',password,consent:true},ip:'192.0.2.34'})).data;assert.equal((await call('/api/attempts/'+attempt,{method:'PUT',token:opponent.token,body:{answers:first.answers,finished:true}})).status,404);
  const q=(await call('/api/admin/questions',{admin:true})).data.questions[0];await call('/api/admin/questions/'+q.id,{method:'PUT',admin:true,body:{...q,prompt:q.prompt+'!'}});assert.equal((await call('/api/leaderboard')).data.items.length,0);
 });
 test('Сброс по коду отзывает старые входы, выдаёт новый код и сохраняет аккаунт',async()=>{

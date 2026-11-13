@@ -10,7 +10,7 @@ function validateModes(modes,questions){if(!Array.isArray(modes)||!modes.length|
 
 async function loadModes(env){const row=await env.DB.prepare("SELECT * FROM settings WHERE key='modes'").first();return {modes:row?JSON.parse(row.data):defaultModes,revision:row?.revision||0};}
 async function modeRoutes(req,env,p,isAdmin){
- if(p==='/api/archive'&&req.method==='GET')return json({schemaVersion:1,questions:await loadQuestions(env),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
+ if(p==='/api/archive'&&req.method==='GET')return json({schemaVersion:1,questions:(await loadQuestions(env)).map(publicQuestion),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
  if(p==='/api/modes'&&req.method==='GET'){const data=await loadModes(env);return json({...data,modes:data.modes.filter(m=>m.enabled)});}
  if(p!=='/api/admin/modes')return null;if(!isAdmin)return error('Доступ только для администратора.',403);
  if(req.method==='GET')return json(await loadModes(env));if(req.method!=='PUT')return error('Метод не поддерживается.',405);
@@ -33,7 +33,7 @@ function validateQuestion(input,id){if(!input||typeof input!=='object')throw Err
  return {id,topic:text('topic',160,true),prompt:text('prompt',1200,true),year:input.year,level:input.level,kind:text('kind',80)||'Знаток',options,answer,acceptedAnswers,explanation:text('explanation',4000,true),quote:text('quote',600),image:image||null,imageCredit:credit||null,sources:urls('sources'),media:urls('media')};}
 async function boundedBytes(req,limit){const reader=req.body?.getReader();if(!reader)return null;const chunks=[];let size=0;for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit){await reader.cancel();return null;}chunks.push(value);}const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}return bytes;}
 async function cmsRoutes(req,env,p,isAdmin){
- if(p==='/api/questions'&&req.method==='GET')return json({questions:await loadQuestions(env),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
+ if(p==='/api/questions'&&req.method==='GET')return json({questions:(await loadQuestions(env)).map(publicQuestion),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
  const media=/^\/api\/images\/([a-f0-9-]{36}\.(?:png|jpg|webp))$/.exec(p);if(media&&req.method==='GET'){if(!env.BUCKET)return error('Хранилище изображений недоступно.',503);const object=await env.BUCKET.get('quiz/'+media[1]);if(!object)return error('Изображение не найдено.',404);return new Response(object.body,{headers:{'Content-Type':object.httpMetadata?.contentType||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':'public, max-age=31536000, immutable'}});}
  if(!p.startsWith('/api/admin/questions')&&p!=='/api/admin/images')return null;
  if(!isAdmin)return error('Доступ только для администратора.',403);
@@ -61,16 +61,22 @@ const hex=bytes=>Array.from(new Uint8Array(bytes),v=>v.toString(16).padStart(2,'
 async function mac(text,key){const k=await crypto.subtle.importKey('raw',encoder.encode(key),{name:'HMAC',hash:'SHA-256'},false,['sign']);return hex(await crypto.subtle.sign('HMAC',k,encoder.encode(text)));}
 function equal(a,b){if(typeof a!=='string'||typeof b!=='string'||a.length!==b.length)return false;let diff=0;for(let i=0;i<a.length;i++)diff|=a.charCodeAt(i)^b.charCodeAt(i);return diff===0;}
 async function passwordHash(password,salt){const key=await crypto.subtle.importKey('raw',encoder.encode(password),'PBKDF2',false,['deriveBits']);return hex(await crypto.subtle.deriveBits({name:'PBKDF2',salt:encoder.encode(salt),iterations:100000,hash:'SHA-256'},key,256));}
+function sessionToken(req,header,cookie){return req.headers.get(header)||new RegExp('(?:^|;\\s*)'+cookie+'=([a-f0-9]{64})(?:;|$)').exec(req.headers.get('cookie')||'')?.[1];}
+function sessionCookie(req,env,name,token,seconds){const cross=req.headers.get('origin')&&req.headers.get('origin')!==new URL(req.url).origin;return `${name}=${token}; Path=/; HttpOnly; ${env.LOCAL_DEV&&new URL(req.url).protocol==='http:'?'':'Secure; '}${cross?'SameSite=None; Partitioned':'SameSite=Strict'}; Max-Age=${seconds}`;}
+function sessionResponse(req,env,data,token,cookie,seconds,status=200){return json({...data,...(req.headers.get('x-session-mode')==='cookie'?{}:{token})},status,{'Set-Cookie':sessionCookie(req,env,cookie,token,seconds)});}
 async function admin(req,env){
  if(env.LOCAL_DEV&&env.ADMIN_EMAILS?.split(',').map(v=>v.trim().toLowerCase()).includes((req.headers.get('oai-authenticated-user-email')||'').toLowerCase()))return true;
- if(!env.ADMIN_SESSION_KEY)return false;
- const token=req.headers.get('authorization')?.replace(/^Bearer /,'')||/(?:^|;\s*)tt_admin=([0-9]+\.[a-f0-9]{32}\.[a-f0-9]{64})(?:;|$)/.exec(req.headers.get('cookie')||'')?.[1];if(!token)return false;
- const [expires,nonce,signature]=token.split('.');if(Number(expires)<Date.now()||Number(expires)>Date.now()+13*3600000)return false;
- return equal(signature,await mac(expires+'.'+nonce,env.ADMIN_SESSION_KEY));
+ const token=sessionToken(req,'authorization','tt_admin')?.replace(/^Bearer /,'');if(!/^[a-f0-9]{64}$/.test(token||''))return false;
+ return !!await env.DB.prepare('SELECT token_hash FROM admin_sessions WHERE token_hash=? AND expires_at>?').bind(await playerDigest(token),Date.now()).first();
 }
+// Atomic counters are keyed to server-verified identities, never browser-generated IDs.
+async function consumeLimit(env,key,limit,windowMs){const now=Date.now();const r=await env.DB.prepare('INSERT INTO auth_rate (key,count,expires_at) VALUES (?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN auth_rate.expires_at<=? THEN 1 ELSE auth_rate.count+1 END,expires_at=CASE WHEN auth_rate.expires_at<=? THEN excluded.expires_at ELSE auth_rate.expires_at END WHERE auth_rate.expires_at<=? OR auth_rate.count<?').bind(key,now+windowMs,now,now,now,limit).run();return !!r.meta.changes;}
+function publicQuestion(q){return {id:q.id,prompt:q.prompt,year:q.year,level:q.level,kind:q.kind,options:q.options,image:q.image,revision:q.revision,quote:q.quote};}
+function pickQuestions(pool,years,count){const shuffle=items=>{const a=[...items];for(let i=a.length-1;i>0;i--){const j=crypto.getRandomValues(new Uint32Array(1))[0]%(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;};const groups=years.map(y=>shuffle(pool.filter(q=>q.year===y)));let selected=[];while(selected.length<count&&groups.some(g=>g.length))for(const g of groups)if(g.length&&selected.length<count)selected.push(g.pop());return shuffle(selected).sort((a,b)=>a.level-b.level);}
+function attemptView(row){const snapshot=JSON.parse(row.question_snapshot),answers=JSON.parse(row.answers);return {id:row.id,startedAt:row.started_at,ids:JSON.parse(row.question_ids),answers,finished:!!row.finished_at,finishedAt:row.finished_at,questions:snapshot.map(q=>Object.hasOwn(answers,q.id)?q:publicQuestion(q))};}
 function validOrigin(req,env){const origin=req.headers.get('origin');return origin===new URL(req.url).origin||origin===env.FRONTEND_ORIGIN;}
 async function authRoutes(req,env,path){
- if(path==='/api/auth/logout'&&req.method==='POST')return json({ok:true},200,{'Set-Cookie':'tt_admin=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'});
+ if(path==='/api/auth/logout'&&req.method==='POST'){const token=sessionToken(req,'authorization','tt_admin')?.replace(/^Bearer /,'');if(token)await env.DB.prepare('DELETE FROM admin_sessions WHERE token_hash=?').bind(await playerDigest(token)).run();return json({ok:true},200,{'Set-Cookie':sessionCookie(req,env,'tt_admin','',0)});}
  if(path!=='/api/auth/login'||req.method!=='POST')return null;
  if(!env.ADMIN_PASSWORD_HASH||!env.ADMIN_PASSWORD_SALT||!env.ADMIN_SESSION_KEY)return error('Вход администратора ещё не настроен.',503);
  const ip=req.headers.get('cf-connecting-ip')||'unknown',key=await mac('login:'+ip,env.ADMIN_SESSION_KEY),now=Date.now();
@@ -78,8 +84,10 @@ async function authRoutes(req,env,path){
  const rate=await env.DB.prepare('SELECT count FROM auth_rate WHERE key=?').bind(key).first();if(rate.count>8)return error('Слишком много попыток входа. Подожди 15 минут.',429);
  const b=await body(req);if(typeof b.password!=='string'||b.password.length>128)return error('Неверный пароль.',401);
  if(!equal(await passwordHash(b.password,env.ADMIN_PASSWORD_SALT),env.ADMIN_PASSWORD_HASH))return error('Неверный пароль.',401);
- const payload=(now+12*3600000)+'.'+crypto.randomUUID().replaceAll('-',''),token=payload+'.'+await mac(payload,env.ADMIN_SESSION_KEY);
- return json({ok:true,token},200,{'Set-Cookie':`tt_admin=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200`});
+ const token=crypto.randomUUID().replaceAll('-','')+crypto.randomUUID().replaceAll('-','');
+ await env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at<=?').bind(now).run();
+ await env.DB.prepare('INSERT INTO admin_sessions(token_hash,expires_at) VALUES (?,?)').bind(await playerDigest(token),now+12*3600000).run();
+ return sessionResponse(req,env,{ok:true},token,'tt_admin',43200);
 }
 
 function guest(req){const player=req.headers.get('x-player-token');if(/^[a-f0-9-]{36}$/.test(player||''))return player;return /(?:^|;\s*)tt_player=([a-f0-9-]{36})(?:;|$)/.exec(req.headers.get('cookie')||'')?.[1];}
@@ -102,18 +110,22 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
    const b=await body(req);const nickname=account.nickname;
    if(nickname.length<2||nickname.length>40||/[\x00-\x1f]/.test(nickname))return error('Ник должен содержать от 2 до 40 символов.');
    if(b.consent!==true)return error('Нужно согласие на сохранение результата.');
-   const current=await loadQuestions(env),active=new Map(current.map(q=>[q.id,q]));const ids=b.ids;if(!Array.isArray(ids)||ids.length<1||ids.length>1000||new Set(ids).size!==ids.length||ids.some(id=>!active.has(id)))return error('Неверный набор вопросов.');
+   const current=await loadQuestions(env),active=new Map(current.map(q=>[q.id,q]));let ids=b.ids;const secure=b.protocol===2;
+   if(secure){const m=(await loadModes(env)).modes.find(m=>m.id===b.modeId&&m.enabled);const years=b.years;if(!m||!Array.isArray(years)||!years.length||new Set(years).size!==years.length||years.some(y=>!Number.isInteger(y)||y<2021||y>2026))return error('Проверь режим и годы.');const pool=modePool(m,current,years);ids=pickQuestions(pool,years,modeCount(m,pool)).map(q=>q.id);}
+   if(!Array.isArray(ids)||ids.length<1||ids.length>1000||new Set(ids).size!==ids.length||ids.some(id=>!active.has(id)))return error('Неверный набор вопросов.');
    if(b.revisions&&ids.some(id=>b.revisions[id]!==active.get(id).revision))return error('Автор изменил вопросы. Обнови страницу и начни заново.',409);
    let modeName=null;if(b.modeId){const m=(await loadModes(env)).modes.find(m=>m.id===b.modeId&&m.enabled);const years=b.years;if(!Array.isArray(years)||!years.length||years.some(y=>!Number.isInteger(y)||y<2021||y>2026))return error('Проверь годы.');const pool=modePool(m,current,years);if(!m||ids.length!==modeCount(m,pool)||ids.some(id=>!pool.some(q=>q.id===id)))return error('Состав режима изменён. Обнови страницу.',409);modeName=m.name;}
-   const ranking=b.modeId?await prepareRanking(env,b.modeId,current):null;const eligible=ranking&&Array.isArray(b.years)&&new Set(b.years).size===6&&[2021,2022,2023,2024,2025,2026].every(y=>b.years.includes(y));
-   const snapshot=ids.map(id=>active.get(id));const owner=guest(req)||crypto.randomUUID(),now=Date.now();const recent=await env.DB.prepare('SELECT COUNT(*) AS n FROM attempts WHERE owner=? AND started_at>?').bind(owner,now-3600000).first();if(recent.n>=20)return error('Слишком много попыток. Попробуй через час.',429);
+   const ranking=b.modeId?await prepareRanking(env,b.modeId,current):null;const eligible=secure&&ranking&&Array.isArray(b.years)&&new Set(b.years).size===6&&[2021,2022,2023,2024,2025,2026].every(y=>b.years.includes(y));
+   const snapshot=ids.map(id=>active.get(id));const owner=guest(req)||crypto.randomUUID(),now=Date.now();if(!await consumeLimit(env,'attempt-account:'+account.id,20,3600000))return error('Слишком много попыток. Попробуй через час.',429);
    const id=crypto.randomUUID(),max=ids.reduce((s,id)=>s+active.get(id).level,0),years=[...new Set(ids.map(id=>active.get(id).year))].sort();
    await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points,question_snapshot,mode_name,account_id,mode_id,board_key,public_consent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max,JSON.stringify(snapshot),modeName,account.id,b.modeId||null,eligible?ranking.key:null,b.publicConsent===true?1:0).run();
-   return json({id,startedAt:now},201,{'Set-Cookie':`tt_player=${owner}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`});
+   return json({id,startedAt:now,...(secure?{protocol:2,questions:snapshot.map(publicQuestion)}:{})},201,{'Set-Cookie':`tt_player=${owner}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`});
   }
   const match=/^\/api\/attempts\/([a-f0-9-]{36})$/.exec(p);
+  if(match&&req.method==='GET'){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(match[1]).first(),account=await playerAccount(req,env);if(!row||row.account_id!==account?.id)return error('Попытка не найдена.',404);if(row.deleted_at)return error('Попытка удалена.',410);return json(attemptView(row));}
   if(match&&req.method==='PUT'){
    const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(match[1]).first();const account=await playerAccount(req,env);if(!row||(row.account_id?row.account_id!==account?.id:row.owner!==(guest(req)||'')))return error('Попытка не найдена в этом аккаунте или браузере.',404);if(row.deleted_at)return error('Автор удалил эту попытку из статистики.',410);
+   if(!await consumeLimit(env,'progress-account:'+(account?.id||row.owner),300,60000))return error('Слишком частые сохранения. Подожди минуту.',429);
    const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const b=await body(req),ids=JSON.parse(row.question_ids),old=JSON.parse(row.answers),answers=b.answers;
    if(!answers||Array.isArray(answers)||typeof answers!=='object'||Object.keys(answers).some(id=>!ids.includes(id)))return error('Неверные ответы.');
    if(Object.entries(old).some(([id,a])=>answers[id]!==a))return error('Сохранённый ответ нельзя заменить.',409);
@@ -123,7 +135,7 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
    const s=score(ids,answers,map),finished=row.finished_at||(b.finished===true?Date.now():null);
    const result=await env.DB.prepare('UPDATE attempts SET answers=?,answered=?,correct=?,points=?,percent=?,updated_at=?,finished_at=?,revision=revision+1 WHERE id=? AND revision=?').bind(JSON.stringify(answers),s.answered,s.correct,s.points,s.percent,Date.now(),finished,row.id,row.revision).run();
    if(!result.meta.changes)return error('Попытка обновлена в другой вкладке. Повтори сохранение.',409);
-   return json({saved:true,finished:!!finished,...s});
+   return json({saved:true,finished:!!finished,...s,feedback:ids.slice(Math.max(0,count-1),count).map(id=>map.get(id))});
   }
   if(p.startsWith('/api/admin')){
    if(!isAdmin)return error('Доступ только для администратора.',403);
@@ -153,6 +165,6 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
 }
 export default {async fetch(req,env){const origin=req.headers.get('origin'),allowed=origin===env.FRONTEND_ORIGIN;let response;
  if(req.method==='OPTIONS'){response=allowed?new Response(null,{status:204}):error('Источник не разрешён.',403);}else{try{response=await handle(req,env);}catch(e){console.error('Ошибка запроса',e?.message);response=error('Не удалось обработать запрос. Повтори позже.',500);}}
- if(allowed&&new URL(req.url).pathname.startsWith('/api/')){const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',origin);headers.set('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');headers.set('Access-Control-Allow-Headers','Content-Type,X-Player-Token,X-Account-Token,Authorization');headers.set('Vary','Origin');response=new Response(response.body,{status:response.status,headers});}return response;}};
+ if(allowed&&new URL(req.url).pathname.startsWith('/api/')){const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',origin);headers.set('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');headers.set('Access-Control-Allow-Headers','Content-Type,X-Player-Token,X-Account-Token,Authorization,X-Session-Mode');headers.set('Access-Control-Allow-Credentials','true');headers.set('Vary','Origin');response=new Response(response.body,{status:response.status,headers});}return response;}};
 
 

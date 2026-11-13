@@ -1,4 +1,4 @@
-import {apiFetch,setAccountToken} from './config.mjs?v=3.1.0';
+import {apiFetch,setAccountToken} from './config.mjs?v=3.2.0';
 let account=null,afterLogin=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const dialog=document.querySelector('#dialog'),content=document.querySelector('#dialog-content');
@@ -27,7 +27,7 @@ if(dialog){dialog.addEventListener('click',async e=>{const b=e.target.closest('[
   const label=b.textContent;b.disabled=true;form.setAttribute('aria-busy','true');b.textContent=tab==='register'?'Создаём аккаунт…':tab==='recover'?'Восстанавливаем доступ…':'Входим…';status.textContent='';
   try{
    const data=await api('/api/account/'+tab,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname,password,recoveryCode:f.get('recoveryCode'),consent:f.has('consent')})});
-   setAccountToken(data.token);change(data.account);form.reset();if(data.recoveryCode)recovery(data.recoveryCode);else finish();
+   const verified=await api('/api/account/me');change(verified.account);form.reset();if(data.recoveryCode){recovery(data.recoveryCode);if(!verified.account)content.querySelector('#account-error').textContent='Аккаунт сохранён. Сохрани код, затем разреши cookie для сайта и войди заново.';}else{if(!verified.account)throw Error('Браузер не сохранил вход. Разреши cookie для сайта или открой его в обновлённом Chrome.');finish();}
   }catch(err){if(status.isConnected){status.textContent=err.message||'Не удалось отправить форму. Попробуй ещё раз.';status.scrollIntoView({block:'nearest'});}}
   finally{b.disabled=false;b.textContent=label;form.removeAttribute('aria-busy');}
  });
