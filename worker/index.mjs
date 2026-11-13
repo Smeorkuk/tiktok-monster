@@ -1,3 +1,4 @@
+import {clipRoutes,resolveQuestionClip} from './clips.mjs';
 import {loadAppearance,appearanceRoutes} from './appearance.mjs';
 import {playerRoutes,playerAccount,publicBoard,prepareRanking} from './players.mjs';
 const defaultModes=[
@@ -30,7 +31,7 @@ function validateQuestion(input,id){if(!input||typeof input!=='object')throw Err
  const options=Array.isArray(input.options)?input.options.map(v=>typeof v==='string'?v.trim():''):null;if(!options||options.length>10||options.some(v=>!v||v.length>300)||new Set(options).size!==options.length)throw Error('Добавь от 1 до 10 разных вариантов или выбери письменный ответ.');const answer=typeof input.answer==='string'?input.answer.trim():'';if(!answer||answer.length>300||(options.length&&!options.includes(answer)))throw Error('Укажи правильный ответ (до 300 символов).');let acceptedAnswers=[];if(!options.length){if(!normalizeAnswer(answer))throw Error('Ответ должен содержать буквы или цифры.');const aliases=input.acceptedAnswers||[];if(!Array.isArray(aliases)||aliases.length>20||aliases.some(a=>typeof a!=='string'||a.length>300||!normalizeAnswer(a)))throw Error('Допустимо до 20 дополнительных написаний ответа, каждое до 300 символов.');acceptedAnswers=[...new Set(aliases.map(a=>a.trim()))];}if(!Number.isInteger(input.year)||input.year<2021||input.year>2026)throw Error('Год должен быть от 2021 до 2026.');if(![1,2,3].includes(input.level))throw Error('Выбери сложность.');
  const urls=(key)=>{const a=input[key]||[];if(!Array.isArray(a)||a.length>8||a.some(u=>typeof u!=='string'||u.length>2048||!/^https?:\/\/[^\s]+$/i.test(u)))throw Error('Проверь ссылки: нужны адреса http или https (до 8).');return a;};const image=text('image',2048);if(image&&!/^https?:\/\/[^\s]+$/i.test(image)&&!/^assets\/[a-zA-Z0-9_.-]+$/.test(image))throw Error('Укажи прямую ссылку http/https на изображение или загрузи файл.');
  const credit=text('imageCredit',2048);if(credit&&!/^https?:\/\/[^\s]+$/i.test(credit))throw Error('Источник картинки должен быть ссылкой http или https.');
- return {id,topic:text('topic',160,true),prompt:text('prompt',1200,true),year:input.year,level:input.level,kind:text('kind',80)||'Знаток',options,answer,acceptedAnswers,explanation:text('explanation',4000,true),quote:text('quote',600),image:image||null,imageCredit:credit||null,sources:urls('sources'),media:urls('media')};}
+ return {id,topic:text('topic',160,true),prompt:text('prompt',1200,true),year:input.year,level:input.level,kind:text('kind',80)||'Знаток',options,answer,acceptedAnswers,explanation:text('explanation',4000,true),quote:text('quote',600),clip:null,image:image||null,imageCredit:credit||null,sources:urls('sources'),media:urls('media')};}
 async function boundedBytes(req,limit){const reader=req.body?.getReader();if(!reader)return null;const chunks=[];let size=0;for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit){await reader.cancel();return null;}chunks.push(value);}const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}return bytes;}
 async function cmsRoutes(req,env,p,isAdmin){
  if(p==='/api/questions'&&req.method==='GET')return json({questions:(await loadQuestions(env)).map(publicQuestion),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
@@ -46,7 +47,7 @@ async function cmsRoutes(req,env,p,isAdmin){
  const match=/^\/api\/admin\/questions\/([a-zA-Z0-9_-]{1,80})$/.exec(p);const creating=p==='/api/admin/questions'&&req.method==='POST';
  if(!creating&&!(match&&req.method==='PUT'))return error('Метод не поддерживается.',405);
  const b=await body(req),id=creating?'custom-'+crypto.randomUUID():match[1];const questions=await loadQuestions(env,true),existing=questions.find(q=>q.id===id);if(!creating&&!existing)return error('Вопрос не найден.',404);if(creating&&questions.length>=1000)return error('Достигнут лимит в 1000 вопросов.');const expected=existing?.revision||0;if(!creating&&b.revision!==expected)return error('Этот вопрос уже изменён. Вернись в список и открой его заново.',409);
- let q;try{q=validateQuestion(b,id);}catch(e){return error(e.message);}const enabled=b.enabled!==false;
+ let q;try{q=validateQuestion(b,id);q.clip=await resolveQuestionClip(env,b.clip);}catch(e){return error(e.message);}const enabled=b.enabled!==false;
  const result=await env.DB.prepare('INSERT INTO questions (id,data,enabled,revision,updated_at) VALUES (?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,enabled=excluded.enabled,revision=questions.revision+1,updated_at=excluded.updated_at WHERE questions.revision=?').bind(id,JSON.stringify(q),enabled?1:0,Date.now(),expected).run();if(!result.meta.changes)return error('Вопрос уже изменён. Открой его заново.',409);return json({...q,enabled,revision:expected+1},creating?201:200);
 }
 
@@ -71,7 +72,7 @@ async function admin(req,env){
 }
 // Atomic counters are keyed to server-verified identities, never browser-generated IDs.
 async function consumeLimit(env,key,limit,windowMs){const now=Date.now();const r=await env.DB.prepare('INSERT INTO auth_rate (key,count,expires_at) VALUES (?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN auth_rate.expires_at<=? THEN 1 ELSE auth_rate.count+1 END,expires_at=CASE WHEN auth_rate.expires_at<=? THEN excluded.expires_at ELSE auth_rate.expires_at END WHERE auth_rate.expires_at<=? OR auth_rate.count<?').bind(key,now+windowMs,now,now,now,limit).run();return !!r.meta.changes;}
-function publicQuestion(q){return {id:q.id,prompt:q.prompt,year:q.year,level:q.level,kind:q.kind,options:q.options,image:q.image,revision:q.revision,quote:q.quote};}
+function publicQuestion(q){return {id:q.id,prompt:q.prompt,year:q.year,level:q.level,kind:q.kind,options:q.options,image:q.image,revision:q.revision,quote:q.quote,clip:q.clip||null};}
 function pickQuestions(pool,years,count){const shuffle=items=>{const a=[...items];for(let i=a.length-1;i>0;i--){const j=crypto.getRandomValues(new Uint32Array(1))[0]%(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;};const groups=years.map(y=>shuffle(pool.filter(q=>q.year===y)));let selected=[];while(selected.length<count&&groups.some(g=>g.length))for(const g of groups)if(g.length&&selected.length<count)selected.push(g.pop());return shuffle(selected).sort((a,b)=>a.level-b.level);}
 function attemptView(row){const snapshot=JSON.parse(row.question_snapshot),answers=JSON.parse(row.answers);return {id:row.id,startedAt:row.started_at,ids:JSON.parse(row.question_ids),answers,finished:!!row.finished_at,finishedAt:row.finished_at,questions:snapshot.map(q=>Object.hasOwn(answers,q.id)?q:publicQuestion(q))};}
 function validOrigin(req,env){const origin=req.headers.get('origin');return origin===new URL(req.url).origin||origin===env.FRONTEND_ORIGIN;}
@@ -104,6 +105,7 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
   const auth=await authRoutes(req,env,p);if(auth)return auth;
   const appearance=await appearanceRoutes(req,env,p,isAdmin);if(appearance)return appearance;
   const modes=await modeRoutes(req,env,p,isAdmin);if(modes)return modes;
+  const clip=await clipRoutes(req,env,p,isAdmin);if(clip)return clip;
   const cms=await cmsRoutes(req,env,p,isAdmin);if(cms)return cms;
   if(p==='/api/attempts'&&req.method==='POST'){
    const account=await playerAccount(req,env);if(!account)return error('Обнови страницу и войди или создай аккаунт, чтобы закрепить свой ник.',401);
@@ -161,7 +163,7 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
  if(!['GET','HEAD'].includes(req.method))return error('Метод не поддерживается.',405);
  if(p==='/admin/'&&assets['/admin.html'])return Response.redirect(new URL('/admin.html',req.url),302);
  let file=p==='/'?'/index.html':p==='/archive/'?'/archive/index.html':(p==='/admin'||p==='/admin/')?'/admin.html':p;try{file=decodeURIComponent(file);}catch{return error('Неверный адрес.',400);}const asset=assets[file];if(!asset)return new Response('Не найдено',{status:404});
- const bytes=Uint8Array.from(atob(asset[1]),c=>c.charCodeAt(0));return new Response(req.method==='HEAD'?null:bytes,{headers:{'Content-Type':asset[0],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"}});
+ const bytes=Uint8Array.from(atob(asset[1]),c=>c.charCodeAt(0));return new Response(req.method==='HEAD'?null:bytes,{headers:{'Content-Type':asset[0],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; img-src 'self' data: https: http:; media-src 'self' https: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"}});
 }
 export default {async fetch(req,env){const origin=req.headers.get('origin'),allowed=origin===env.FRONTEND_ORIGIN;let response;
  if(req.method==='OPTIONS'){response=allowed?new Response(null,{status:204}):error('Источник не разрешён.',403);}else{try{response=await handle(req,env);}catch(e){console.error('Ошибка запроса',e?.message);response=error('Не удалось обработать запрос. Повтори позже.',500);}}

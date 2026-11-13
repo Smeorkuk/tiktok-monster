@@ -1,4 +1,4 @@
-import {isCorrect,validAnswer} from './answers.mjs?v=3.2.0';
+import {isCorrect,validAnswer} from './answers.mjs?v=3.3.0';
 export const VERSION=1;
 export function shuffle(items,rng=Math.random){const out=[...items];for(let i=out.length-1;i>0;i--){const j=Math.floor(rng()*(i+1));[out[i],out[j]]=[out[j],out[i]];}return out;}
 export function createSession(bank,years,count,rng=Math.random){
