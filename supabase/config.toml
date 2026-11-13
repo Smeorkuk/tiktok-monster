@@ -1,0 +1,3 @@
+[functions.quiz-api]
+verify_jwt = false
+entrypoint = "./functions/quiz-api/edge.mjs"
