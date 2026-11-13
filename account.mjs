@@ -1,4 +1,4 @@
-import {apiFetch,setAccountToken} from './config.mjs?v=3.0.1';
+import {apiFetch,setAccountToken} from './config.mjs?v=3.1.0';
 let account=null,afterLogin=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const dialog=document.querySelector('#dialog'),content=document.querySelector('#dialog-content');
