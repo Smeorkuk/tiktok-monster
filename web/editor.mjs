@@ -1,4 +1,4 @@
-import {adminFetch} from './config.mjs';
+import {adminFetch} from './config.mjs?v=3.0.1';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function mountEditor(root,onBack){let questions=[],filter='',show='all',year='all',current=null,dirty=false,answerMode='choice';const unsubscribe=()=>{window.removeEventListener('beforeunload',unload);};const unload=e=>{if(dirty){e.preventDefault();e.returnValue='';}};window.addEventListener('beforeunload',unload);
  async function api(path,options={}){const r=await adminFetch(path,{cache:'no-store',...options}),b=await r.json();if(!r.ok)throw Error(b.error||'Ошибка сервера');return b;}
