@@ -1,5 +1,5 @@
-import {adminFetch} from './config.mjs?v=3.1.0';
-import {modePool,modeCount} from './modes.mjs?v=3.1.0';
+import {adminFetch} from './config.mjs?v=3.2.0';
+import {modePool,modeCount} from './modes.mjs?v=3.2.0';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function mountModes(root,onBack){
  let modes=[],questions=[],revision=0,dirty=false,saving=false;
