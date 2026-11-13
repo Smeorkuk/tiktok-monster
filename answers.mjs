@@ -1,0 +1,3 @@
+export function normalizeAnswer(value){return typeof value==='string'?value.normalize('NFKC').toLocaleLowerCase('ru-RU').replaceAll('ё','е').replace(/[^\p{L}\p{N}]+/gu,' ').trim():'';}
+export function isCorrect(q,value){if(typeof value!=='string')return false;if(q.options.length)return value===q.answer;const normalized=normalizeAnswer(value);return !!normalized&&[q.answer,...(q.acceptedAnswers||[])].some(a=>normalizeAnswer(a)===normalized);}
+export function validAnswer(q,value){return value===null||(typeof value==='string'&&(q.options.length?q.options.includes(value):value.length<=300&&!!normalizeAnswer(value)));}
