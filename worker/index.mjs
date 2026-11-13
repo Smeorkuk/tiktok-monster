@@ -1,3 +1,4 @@
+import {cmsRoutes,loadQuestions} from './cms.mjs';
 import bank from './bank.mjs';
 import assets from './assets.mjs';
 const byId=new Map(bank.map(q=>[q.id,q]));
@@ -30,35 +31,37 @@ async function authRoutes(req,env,path){
 }
 
 function guest(req){const player=req.headers.get('x-player-token');if(/^[a-f0-9-]{36}$/.test(player||''))return player;return /(?:^|;\s*)tt_player=([a-f0-9-]{36})(?:;|$)/.exec(req.headers.get('cookie')||'')?.[1];}
-function summary(row){const {owner,question_ids,answers,years,...rest}=row;return {...rest,years:JSON.parse(years)};}
-async function body(req){if(!req.headers.get('content-type')?.includes('application/json'))throw Error('Требуется JSON.');if(Number(req.headers.get('content-length')||0)>30000)throw Error('Запрос слишком большой.');const text=await req.text();if(text.length>30000)throw Error('Запрос слишком большой.');return JSON.parse(text);}
-function score(ids,answers){let points=0,max=0,correct=0;for(const id of ids){const q=byId.get(id);max+=q.level;if(answers[id]===q.answer){points+=q.level;correct++;}}return {points,max,correct,percent:Math.round(points/max*100),answered:Object.keys(answers).length};}
+function summary(row){const {owner,question_ids,question_snapshot,answers,years,...rest}=row;return {...rest,years:JSON.parse(years)};}
+async function body(req){if(!req.headers.get('content-type')?.includes('application/json'))throw Error('Требуется JSON.');if(Number(req.headers.get('content-length')||0)>512000)throw Error('Запрос слишком большой.');const text=await req.text();if(text.length>512000)throw Error('Запрос слишком большой.');return JSON.parse(text);}
+function score(ids,answers,map=byId){let points=0,max=0,correct=0;for(const id of ids){const q=map.get(id);max+=q.level;if(answers[id]===q.answer){points+=q.level;correct++;}}return {points,max,correct,percent:Math.round(points/max*100),answered:Object.keys(answers).length};}
 export async function handle(req,env){const url=new URL(req.url),p=url.pathname;const isAdmin=await admin(req,env);
  if(p==='/api/me')return json({isAdmin,tracking:true});
  if(p.startsWith('/api/')){
   if(!env.DB)return error('База результатов временно недоступна.',503);
   if(!['GET','HEAD'].includes(req.method)&&!validOrigin(req,env))return error('Недопустимый источник запроса.',403);
   const auth=await authRoutes(req,env,p);if(auth)return auth;
+  const cms=await cmsRoutes(req,env,p,isAdmin);if(cms)return cms;
   if(p==='/api/attempts'&&req.method==='POST'){
    const b=await body(req);const nickname=typeof b.nickname==='string'?b.nickname.trim():'';
    if(nickname.length<2||nickname.length>40||/[\x00-\x1f]/.test(nickname))return error('Ник должен содержать от 2 до 40 символов.');
    if(b.consent!==true)return error('Нужно согласие на сохранение результата.');
-   const ids=b.ids;if(!Array.isArray(ids)||ids.length<1||ids.length>72||new Set(ids).size!==ids.length||ids.some(id=>!byId.has(id)))return error('Неверный набор вопросов.');
-   const owner=guest(req)||crypto.randomUUID(),now=Date.now();const recent=await env.DB.prepare('SELECT COUNT(*) AS n FROM attempts WHERE owner=? AND started_at>?').bind(owner,now-3600000).first();if(recent.n>=20)return error('Слишком много попыток. Попробуй через час.',429);
-   const id=crypto.randomUUID(),max=ids.reduce((s,id)=>s+byId.get(id).level,0),years=[...new Set(ids.map(id=>byId.get(id).year))].sort();
-   await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max).run();
+   const current=await loadQuestions(env),active=new Map(current.map(q=>[q.id,q]));const ids=b.ids;if(!Array.isArray(ids)||ids.length<1||ids.length>1000||new Set(ids).size!==ids.length||ids.some(id=>!active.has(id)))return error('Неверный набор вопросов.');
+   if(b.revisions&&ids.some(id=>b.revisions[id]!==active.get(id).revision))return error('Автор изменил вопросы. Обнови страницу и начни заново.',409);
+   const snapshot=ids.map(id=>active.get(id));const owner=guest(req)||crypto.randomUUID(),now=Date.now();const recent=await env.DB.prepare('SELECT COUNT(*) AS n FROM attempts WHERE owner=? AND started_at>?').bind(owner,now-3600000).first();if(recent.n>=20)return error('Слишком много попыток. Попробуй через час.',429);
+   const id=crypto.randomUUID(),max=ids.reduce((s,id)=>s+active.get(id).level,0),years=[...new Set(ids.map(id=>active.get(id).year))].sort();
+   await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points,question_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max,JSON.stringify(snapshot)).run();
    return json({id,startedAt:now},201,{'Set-Cookie':`tt_player=${owner}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`});
   }
   const match=/^\/api\/attempts\/([a-f0-9-]{36})$/.exec(p);
   if(match&&req.method==='PUT'){
    const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=? AND owner=?').bind(match[1],guest(req)||'').first();if(!row)return error('Попытка не найдена в этом браузере.',404);
-   const b=await body(req),ids=JSON.parse(row.question_ids),old=JSON.parse(row.answers),answers=b.answers;
+   const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const b=await body(req),ids=JSON.parse(row.question_ids),old=JSON.parse(row.answers),answers=b.answers;
    if(!answers||Array.isArray(answers)||typeof answers!=='object'||Object.keys(answers).some(id=>!ids.includes(id)))return error('Неверные ответы.');
    if(Object.entries(old).some(([id,a])=>answers[id]!==a))return error('Сохранённый ответ нельзя заменить.',409);
    const count=Object.keys(answers).length;if(!ids.slice(0,count).every(id=>Object.hasOwn(answers,id)))return error('Ответы должны идти по порядку.');
-   if(Object.entries(answers).some(([id,a])=>a!==null&&!byId.get(id).options.includes(a)))return error('Неизвестный вариант ответа.');
+   if(Object.entries(answers).some(([id,a])=>a!==null&&!map.get(id).options.includes(a)))return error('Неизвестный вариант ответа.');
    if(b.finished===true&&count!==ids.length)return error('Есть неотвеченные вопросы.');
-   const s=score(ids,answers),finished=row.finished_at||(b.finished===true?Date.now():null);
+   const s=score(ids,answers,map),finished=row.finished_at||(b.finished===true?Date.now():null);
    const result=await env.DB.prepare('UPDATE attempts SET answers=?,answered=?,correct=?,points=?,percent=?,updated_at=?,finished_at=?,revision=revision+1 WHERE id=? AND revision=?').bind(JSON.stringify(answers),s.answered,s.correct,s.points,s.percent,Date.now(),finished,row.id,row.revision).run();
    if(!result.meta.changes)return error('Попытка обновлена в другой вкладке. Повтори сохранение.',409);
    return json({saved:true,finished:!!finished,...s});
@@ -77,14 +80,14 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
     const clause=where.join(' AND '),n=await env.DB.prepare('SELECT COUNT(*) n FROM attempts WHERE '+clause).bind(...args).first();
     const rows=await env.DB.prepare('SELECT * FROM attempts WHERE '+clause+' ORDER BY started_at DESC,id DESC LIMIT 30 OFFSET ?').bind(...args,offset).all();return json({items:rows.results.map(summary),total:n.n,offset});
    }
-   const detail=/^\/api\/admin\/attempts\/([a-f0-9-]{36})$/.exec(p);if(detail){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(detail[1]).first();if(!row)return error('Попытка не найдена.',404);const answers=JSON.parse(row.answers);return json({...summary(row),questions:JSON.parse(row.question_ids).map(id=>{const q=byId.get(id);return {id,prompt:q.prompt,year:q.year,answer:q.answer,chosen:answers[id],answered:Object.hasOwn(answers,id),correct:answers[id]===q.answer,sources:q.sources};})});}
+   const detail=/^\/api\/admin\/attempts\/([a-f0-9-]{36})$/.exec(p);if(detail){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(detail[1]).first();if(!row)return error('Попытка не найдена.',404);const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const answers=JSON.parse(row.answers);return json({...summary(row),questions:JSON.parse(row.question_ids).map(id=>{const q=map.get(id);return {id,prompt:q.prompt,year:q.year,answer:q.answer,chosen:answers[id],answered:Object.hasOwn(answers,id),correct:answers[id]===q.answer,sources:q.sources};})});}
    return error('Не найдено.',404);
   }
   return error('Не найдено.',404);
  }
  if(!['GET','HEAD'].includes(req.method))return error('Метод не поддерживается.',405);
  let file=p==='/'?'/index.html':p==='/admin'?'/admin.html':p;const asset=assets[file];if(!asset)return new Response('Не найдено',{status:404});
- const bytes=Uint8Array.from(atob(asset[1]),c=>c.charCodeAt(0));return new Response(req.method==='HEAD'?null:bytes,{headers:{'Content-Type':asset[0],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"}});
+ const bytes=Uint8Array.from(atob(asset[1]),c=>c.charCodeAt(0));return new Response(req.method==='HEAD'?null:bytes,{headers:{'Content-Type':asset[0],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"}});
 }
 export default {async fetch(req,env){const origin=req.headers.get('origin'),allowed=origin===env.FRONTEND_ORIGIN;let response;
  if(req.method==='OPTIONS'){response=allowed?new Response(null,{status:204}):error('Источник не разрешён.',403);}else{try{response=await handle(req,env);}catch(e){console.error('Ошибка запроса',e?.message);response=error('Не удалось обработать запрос. Повтори позже.',500);}}
