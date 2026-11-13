@@ -1,6 +1,7 @@
+import {seedPlayer} from './fixture.mjs';
 import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';import worker from '../dist/server/index.js';import {database} from '../scripts/sqlite.mjs';import {modePool,modeCount} from '../web/modes.mjs';
-const DB=database();for(const f of ['0000_attempts','0001_auth_rate','0002_question_editor','0003_modes'])DB.exec(readFileSync('drizzle/'+f+'.sql','utf8'));const env={DB,LOCAL_DEV:true,ADMIN_EMAILS:'owner@test.invalid'};
-async function call(path,method='GET',data,owner=false){return worker.fetch(new Request('https://quiz.test'+path,{method,headers:{Origin:'https://quiz.test','Content-Type':'application/json',...(owner?{'oai-authenticated-user-email':'owner@test.invalid'}:{})},body:data?JSON.stringify(data):undefined}),env);}
+const DB=database();for(const f of ['0000_attempts','0001_auth_rate','0002_question_editor','0003_modes'])DB.exec(readFileSync('drizzle/'+f+'.sql','utf8'));const accountToken=seedPlayer(DB);const env={DB,LOCAL_DEV:true,ADMIN_EMAILS:'owner@test.invalid'};
+async function call(path,method='GET',data,owner=false){return worker.fetch(new Request('https://quiz.test'+path,{method,headers:{'X-Account-Token':accountToken,Origin:'https://quiz.test','Content-Type':'application/json',...(owner?{'oai-authenticated-user-email':'owner@test.invalid'}:{})},body:data?JSON.stringify(data):undefined}),env);}
 test('Режимы: закрытая запись, ручной состав, ревизии и серверная проверка попытки',async()=>{
  assert.equal((await call('/api/admin/modes')).status,403);
  const bank=(await(await call('/api/questions')).json()).questions;

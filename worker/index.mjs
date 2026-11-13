@@ -1,3 +1,4 @@
+import {playerRoutes,playerAccount,publicBoard,prepareRanking} from './players.mjs';
 const defaultModes=[
 {id:'quick',name:'Быстрый скролл',description:'Проверить, в теме ли ты.',count:18,selection:'all',questionIds:[],enabled:true},
 {id:'big',name:'Большой заход',description:'От базы до забытых мемов.',count:36,selection:'all',questionIds:[],enabled:true},
@@ -89,24 +90,28 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
  if(p.startsWith('/api/')){
   if(!env.DB)return error('База результатов временно недоступна.',503);
   if(!['GET','HEAD'].includes(req.method)&&!validOrigin(req,env))return error('Недопустимый источник запроса.',403);
+  const player=await playerRoutes(req,env,p);if(player)return player;
+  if(p==='/api/leaderboard'&&req.method==='GET')return await publicBoard(req,env);
   const auth=await authRoutes(req,env,p);if(auth)return auth;
   const modes=await modeRoutes(req,env,p,isAdmin);if(modes)return modes;
   const cms=await cmsRoutes(req,env,p,isAdmin);if(cms)return cms;
   if(p==='/api/attempts'&&req.method==='POST'){
-   const b=await body(req);const nickname=typeof b.nickname==='string'?b.nickname.trim():'';
+   const account=await playerAccount(req,env);if(!account)return error('Обнови страницу и войди или создай аккаунт, чтобы закрепить свой ник.',401);
+   const b=await body(req);const nickname=account.nickname;
    if(nickname.length<2||nickname.length>40||/[\x00-\x1f]/.test(nickname))return error('Ник должен содержать от 2 до 40 символов.');
    if(b.consent!==true)return error('Нужно согласие на сохранение результата.');
    const current=await loadQuestions(env),active=new Map(current.map(q=>[q.id,q]));const ids=b.ids;if(!Array.isArray(ids)||ids.length<1||ids.length>1000||new Set(ids).size!==ids.length||ids.some(id=>!active.has(id)))return error('Неверный набор вопросов.');
    if(b.revisions&&ids.some(id=>b.revisions[id]!==active.get(id).revision))return error('Автор изменил вопросы. Обнови страницу и начни заново.',409);
    let modeName=null;if(b.modeId){const m=(await loadModes(env)).modes.find(m=>m.id===b.modeId&&m.enabled);const years=b.years;if(!Array.isArray(years)||!years.length||years.some(y=>!Number.isInteger(y)||y<2021||y>2026))return error('Проверь годы.');const pool=modePool(m,current,years);if(!m||ids.length!==modeCount(m,pool)||ids.some(id=>!pool.some(q=>q.id===id)))return error('Состав режима изменён. Обнови страницу.',409);modeName=m.name;}
+   const ranking=b.modeId?await prepareRanking(env,b.modeId,current):null;const eligible=ranking&&Array.isArray(b.years)&&new Set(b.years).size===6&&[2021,2022,2023,2024,2025,2026].every(y=>b.years.includes(y));
    const snapshot=ids.map(id=>active.get(id));const owner=guest(req)||crypto.randomUUID(),now=Date.now();const recent=await env.DB.prepare('SELECT COUNT(*) AS n FROM attempts WHERE owner=? AND started_at>?').bind(owner,now-3600000).first();if(recent.n>=20)return error('Слишком много попыток. Попробуй через час.',429);
    const id=crypto.randomUUID(),max=ids.reduce((s,id)=>s+active.get(id).level,0),years=[...new Set(ids.map(id=>active.get(id).year))].sort();
-   await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points,question_snapshot,mode_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max,JSON.stringify(snapshot),modeName).run();
+   await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points,question_snapshot,mode_name,account_id,mode_id,board_key,public_consent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max,JSON.stringify(snapshot),modeName,account.id,b.modeId||null,eligible?ranking.key:null,b.publicConsent===true?1:0).run();
    return json({id,startedAt:now},201,{'Set-Cookie':`tt_player=${owner}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`});
   }
   const match=/^\/api\/attempts\/([a-f0-9-]{36})$/.exec(p);
   if(match&&req.method==='PUT'){
-   const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=? AND owner=?').bind(match[1],guest(req)||'').first();if(!row)return error('Попытка не найдена в этом браузере.',404);
+   const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(match[1]).first();const account=await playerAccount(req,env);if(!row||(row.account_id?row.account_id!==account?.id:row.owner!==(guest(req)||'')))return error('Попытка не найдена в этом аккаунте или браузере.',404);if(row.deleted_at)return error('Автор удалил эту попытку из статистики.',410);
    const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const b=await body(req),ids=JSON.parse(row.question_ids),old=JSON.parse(row.answers),answers=b.answers;
    if(!answers||Array.isArray(answers)||typeof answers!=='object'||Object.keys(answers).some(id=>!ids.includes(id)))return error('Неверные ответы.');
    if(Object.entries(old).some(([id,a])=>answers[id]!==a))return error('Сохранённый ответ нельзя заменить.',409);
@@ -120,14 +125,16 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
   }
   if(p.startsWith('/api/admin')){
    if(!isAdmin)return error('Доступ только для администратора.',403);
+   const removing=/^\/api\/admin\/attempts\/([a-f0-9-]{36})(?:\/(restore|remove-player))?$/.exec(p);
+   if(removing&&(req.method==='DELETE'||req.method==='POST')){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(removing[1]).first();if(!row)return error('Попытка не найдена.',404);if(req.method==='DELETE'&&!removing[2]){await env.DB.prepare('UPDATE attempts SET deleted_at=? WHERE id=?').bind(Date.now(),row.id).run();return json({ok:true});}if(req.method==='POST'&&removing[2]==='restore'){await env.DB.prepare('UPDATE attempts SET deleted_at=NULL WHERE id=?').bind(row.id).run();return json({ok:true});}if(req.method==='POST'&&removing[2]==='remove-player'){const result=await env.DB.prepare('UPDATE attempts SET deleted_at=? WHERE '+(row.account_id?'account_id=?':'owner=? AND account_id IS NULL')).bind(Date.now(),row.account_id||row.owner).run();return json({ok:true,removed:result.meta.changes});}return error('Метод не поддерживается.',405);}
    if(req.method!=='GET')return error('Метод не поддерживается.',405);
    if(p==='/api/admin/stats'){
-    const totals=await env.DB.prepare('SELECT COUNT(*) total, SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) finished, ROUND(AVG(CASE WHEN finished_at IS NOT NULL THEN percent END),1) average, COUNT(DISTINCT nickname) nicknames FROM attempts').first();
+    const totals=await env.DB.prepare('SELECT COUNT(*) total, SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) finished, ROUND(AVG(CASE WHEN finished_at IS NOT NULL THEN percent END),1) average, COUNT(DISTINCT nickname) nicknames FROM attempts WHERE deleted_at IS NULL').first();
     return json(totals);
    }
    if(p==='/api/admin/attempts'){
     const search=(url.searchParams.get('q')||'').trim().slice(0,40),state=url.searchParams.get('state'),offset=Math.max(0,Math.min(100000,Number(url.searchParams.get('offset'))||0));
-    const where=['nickname LIKE ?'];const args=['%'+search.replace(/[\\%_]/g,'\\$&')+'%'];where[0]+=" ESCAPE '\\'";
+    const where=['nickname LIKE ?',state==='deleted'?'deleted_at IS NOT NULL':'deleted_at IS NULL'];const args=['%'+search.replace(/[\\%_]/g,'\\$&')+'%'];where[0]+=" ESCAPE '\\'";
     if(state==='finished')where.push('finished_at IS NOT NULL');if(state==='active')where.push('finished_at IS NULL');
     const clause=where.join(' AND '),n=await env.DB.prepare('SELECT COUNT(*) n FROM attempts WHERE '+clause).bind(...args).first();
     const rows=await env.DB.prepare('SELECT * FROM attempts WHERE '+clause+' ORDER BY started_at DESC,id DESC LIMIT 30 OFFSET ?').bind(...args,offset).all();return json({items:rows.results.map(summary),total:n.n,offset});
@@ -138,11 +145,12 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
   return error('Не найдено.',404);
  }
  if(!['GET','HEAD'].includes(req.method))return error('Метод не поддерживается.',405);
+ if(p==='/admin/'&&assets['/admin.html'])return Response.redirect(new URL('/admin.html',req.url),302);
  let file=p==='/'?'/index.html':p==='/archive/'?'/archive/index.html':(p==='/admin'||p==='/admin/')?'/admin.html':p;try{file=decodeURIComponent(file);}catch{return error('Неверный адрес.',400);}const asset=assets[file];if(!asset)return new Response('Не найдено',{status:404});
  const bytes=Uint8Array.from(atob(asset[1]),c=>c.charCodeAt(0));return new Response(req.method==='HEAD'?null:bytes,{headers:{'Content-Type':asset[0],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"}});
 }
 export default {async fetch(req,env){const origin=req.headers.get('origin'),allowed=origin===env.FRONTEND_ORIGIN;let response;
  if(req.method==='OPTIONS'){response=allowed?new Response(null,{status:204}):error('Источник не разрешён.',403);}else{try{response=await handle(req,env);}catch(e){console.error('Ошибка запроса',e?.message);response=error('Не удалось обработать запрос. Повтори позже.',500);}}
- if(allowed&&new URL(req.url).pathname.startsWith('/api/')){const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',origin);headers.set('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');headers.set('Access-Control-Allow-Headers','Content-Type,X-Player-Token,Authorization');headers.set('Vary','Origin');response=new Response(response.body,{status:response.status,headers});}return response;}};
+ if(allowed&&new URL(req.url).pathname.startsWith('/api/')){const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',origin);headers.set('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');headers.set('Access-Control-Allow-Headers','Content-Type,X-Player-Token,X-Account-Token,Authorization');headers.set('Vary','Origin');response=new Response(response.body,{status:response.status,headers});}return response;}};
 
 

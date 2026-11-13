@@ -1,3 +1,46 @@
+const PLAYER_SESSION_MS=30*24*3600000;
+const playerDigest=async text=>hex(await crypto.subtle.digest('SHA-256',encoder.encode(text)));
+async function playerPassword(password,salt){const key=await crypto.subtle.importKey('raw',encoder.encode(password),'PBKDF2',false,['deriveBits']);return hex(await crypto.subtle.deriveBits({name:'PBKDF2',salt:encoder.encode(salt),iterations:600000,hash:'SHA-256'},key,256));}
+function playerNickname(value){if(typeof value!=='string')throw Error('Укажи ник.');const name=value.normalize('NFKC').trim();if(!/^[\p{L}\p{N}_.-]{3,24}$/u.test(name))throw Error('Ник: 3–24 буквы, цифры, точки, дефисы или подчёркивания, без пробелов.');return {name,key:name.toLocaleLowerCase('ru-RU').replaceAll('ё','е')};}
+function checkPlayerPassword(password){if(typeof password!=='string'||password.length<8||password.length>128)throw Error('Пароль должен содержать от 8 до 128 символов.');}
+async function playerLimit(req,env,kind,nickname='',limit=10){const now=Date.now(),ip=req.headers.get('cf-connecting-ip')||'unknown';for(const value of [kind+':ip:'+ip,...(nickname?[kind+':name:'+nickname]:[])]){const key='player:'+await playerDigest(value);await env.DB.prepare('INSERT INTO auth_rate (key,count,expires_at) VALUES (?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN auth_rate.expires_at<? THEN 1 ELSE auth_rate.count+1 END,expires_at=CASE WHEN auth_rate.expires_at<? THEN excluded.expires_at ELSE auth_rate.expires_at END').bind(key,now+900000,now,now).run();const rate=await env.DB.prepare('SELECT count FROM auth_rate WHERE key=?').bind(key).first();const threshold=value.startsWith(kind+':ip:')?(kind==='register'?30:60):limit;if(rate.count>threshold)return error('Слишком много попыток. Подожди 15 минут.',429);}return null;}
+function publicAccount(row){return row?{id:row.id,nickname:row.nickname}:null;}
+async function playerAccount(req,env){const token=req.headers.get('x-account-token');if(!/^[a-f0-9]{64}$/.test(token||''))return null;return await env.DB.prepare('SELECT a.id,a.nickname FROM accounts a JOIN player_sessions s ON s.account_id=a.id AND s.auth_version=a.auth_version WHERE s.token_hash=? AND s.expires_at>?').bind(await playerDigest(token),Date.now()).first();}
+async function playerSession(env,account){const token=crypto.randomUUID().replaceAll('-','')+crypto.randomUUID().replaceAll('-','');await env.DB.prepare('INSERT INTO player_sessions(token_hash,account_id,auth_version,created_at,expires_at) VALUES (?,?,?,?,?)').bind(await playerDigest(token),account.id,account.auth_version,Date.now(),Date.now()+PLAYER_SESSION_MS).run();return token;}
+async function playerRoutes(req,env,p){
+ if(!p.startsWith('/api/account/'))return null;
+ if(p==='/api/account/me'&&req.method==='GET'){const account=await playerAccount(req,env);if(account)await env.DB.prepare('UPDATE player_sessions SET expires_at=? WHERE token_hash=? AND expires_at<?').bind(Date.now()+PLAYER_SESSION_MS,await playerDigest(req.headers.get('x-account-token')),Date.now()+PLAYER_SESSION_MS-86400000).run();return json({account:publicAccount(account)});}
+ if(req.method!=='POST')return error('Метод не поддерживается.',405);
+ if(p==='/api/account/logout'){const token=req.headers.get('x-account-token');if(token)await env.DB.prepare('DELETE FROM player_sessions WHERE token_hash=?').bind(await playerDigest(token)).run();return json({ok:true});}
+ if(!['/api/account/register','/api/account/login','/api/account/recover'].includes(p))return error('Не найдено.',404);
+ const b=await body(req);let nick;try{nick=playerNickname(b.nickname);checkPlayerPassword(b.password);}catch(e){return error(e.message);}
+ const rate=await playerLimit(req,env,p.split('/').pop(),nick.key,p.endsWith('register')?5:10);if(rate)return rate;
+ if(p==='/api/account/register'){
+  if(b.consent!==true)return error('Подтверди создание аккаунта и сохранение ника.');
+  const existing=await env.DB.prepare('SELECT id FROM accounts WHERE nickname_key=?').bind(nick.key).first();if(existing)return error('Этот ник уже занят. Войди в свой аккаунт или выбери другой.',409);
+  const account={id:crypto.randomUUID(),nickname:nick.name,auth_version:1},salt=crypto.randomUUID(),recoveryCode=crypto.randomUUID().replaceAll('-','');
+  const inserted=await env.DB.prepare('INSERT INTO accounts(id,nickname,nickname_key,password_hash,password_salt,recovery_hash,created_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(nickname_key) DO NOTHING').bind(account.id,nick.name,nick.key,await playerPassword(b.password,salt),salt,await playerDigest(recoveryCode),Date.now()).run();if(!inserted.meta.changes)return error('Этот ник уже занят.',409);
+  return json({account:publicAccount(account),token:await playerSession(env,account),recoveryCode},201);
+ }
+ const account=await env.DB.prepare('SELECT * FROM accounts WHERE nickname_key=?').bind(nick.key).first();
+ if(p==='/api/account/recover'){
+  const code=typeof b.recoveryCode==='string'?b.recoveryCode.toLowerCase().replace(/[\s-]/g,''):'';
+  if(!/^[a-f0-9]{32}$/.test(code)||!account||!equal(account.recovery_hash,await playerDigest(code)))return error('Неверный ник или код восстановления.',401);
+  const salt=crypto.randomUUID(),recoveryCode=crypto.randomUUID().replaceAll('-','');const updated=await env.DB.prepare('UPDATE accounts SET password_hash=?,password_salt=?,recovery_hash=?,auth_version=auth_version+1 WHERE id=? AND auth_version=?').bind(await playerPassword(b.password,salt),salt,await playerDigest(recoveryCode),account.id,account.auth_version).run();if(!updated.meta.changes)return error('Данные уже изменились. Повтори восстановление.',409);
+  account.auth_version++;return json({account:publicAccount(account),token:await playerSession(env,account),recoveryCode});
+ }
+ const valid=equal(account?.password_hash||'0'.repeat(64),await playerPassword(b.password,account?.password_salt||'missing-account'));
+ if(!account||!valid)return error('Неверный ник или пароль.',401);
+ return json({account:publicAccount(account),token:await playerSession(env,account)});
+}
+async function prepareRanking(env,modeId,questions){const m=(await loadModes(env)).modes.find(m=>m.id===modeId&&m.enabled);if(!m)return null;const pool=modePool(m,questions);return {mode:m,key:await playerDigest(JSON.stringify({id:m.id,count:m.count,selection:m.selection,pool:pool.map(q=>[q.id,q.revision||0,q.level]).sort((a,b)=>a[0].localeCompare(b[0]))}))};}
+async function publicBoard(req,env){const url=new URL(req.url),modes=(await loadModes(env)).modes.filter(m=>m.enabled);const modeId=url.searchParams.get('mode')||modes[0]?.id;const ranking=await prepareRanking(env,modeId,await loadQuestions(env));
+ const stats=await env.DB.prepare('SELECT COUNT(*) AS attempts,COUNT(DISTINCT account_id) AS players,ROUND(AVG(percent),1) AS average FROM attempts WHERE finished_at IS NOT NULL AND deleted_at IS NULL').first();
+ if(!ranking)return json({modes,items:[],stats,modeId:null});
+ const rows=await env.DB.prepare(`SELECT nickname,percent,points,max_points,correct,total,duration,finished_at FROM (SELECT a.nickname,t.percent,t.points,t.max_points,t.correct,t.total,t.finished_at,t.finished_at-t.started_at AS duration,ROW_NUMBER() OVER (PARTITION BY t.account_id ORDER BY t.percent DESC,t.points DESC,(t.finished_at-t.started_at) ASC,t.finished_at ASC,t.id ASC) AS board_position FROM attempts t JOIN accounts a ON a.id=t.account_id WHERE t.board_key=? AND t.public_consent=1 AND t.finished_at IS NOT NULL AND t.deleted_at IS NULL) ranked WHERE board_position=1 ORDER BY percent DESC,points DESC,duration ASC,finished_at ASC,nickname ASC LIMIT 100`).bind(ranking.key).all();
+ return json({modes,modeId,items:rows.results,stats,version:ranking.key.slice(0,10)});
+}
+
 const defaultModes=[
 {id:'quick',name:'Быстрый скролл',description:'Проверить, в теме ли ты.',count:18,selection:'all',questionIds:[],enabled:true},
 {id:'big',name:'Большой заход',description:'От базы до забытых мемов.',count:36,selection:'all',questionIds:[],enabled:true},
@@ -89,24 +132,28 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
  if(p.startsWith('/api/')){
   if(!env.DB)return error('База результатов временно недоступна.',503);
   if(!['GET','HEAD'].includes(req.method)&&!validOrigin(req,env))return error('Недопустимый источник запроса.',403);
+  const player=await playerRoutes(req,env,p);if(player)return player;
+  if(p==='/api/leaderboard'&&req.method==='GET')return await publicBoard(req,env);
   const auth=await authRoutes(req,env,p);if(auth)return auth;
   const modes=await modeRoutes(req,env,p,isAdmin);if(modes)return modes;
   const cms=await cmsRoutes(req,env,p,isAdmin);if(cms)return cms;
   if(p==='/api/attempts'&&req.method==='POST'){
-   const b=await body(req);const nickname=typeof b.nickname==='string'?b.nickname.trim():'';
+   const account=await playerAccount(req,env);if(!account)return error('Обнови страницу и войди или создай аккаунт, чтобы закрепить свой ник.',401);
+   const b=await body(req);const nickname=account.nickname;
    if(nickname.length<2||nickname.length>40||/[\x00-\x1f]/.test(nickname))return error('Ник должен содержать от 2 до 40 символов.');
    if(b.consent!==true)return error('Нужно согласие на сохранение результата.');
    const current=await loadQuestions(env),active=new Map(current.map(q=>[q.id,q]));const ids=b.ids;if(!Array.isArray(ids)||ids.length<1||ids.length>1000||new Set(ids).size!==ids.length||ids.some(id=>!active.has(id)))return error('Неверный набор вопросов.');
    if(b.revisions&&ids.some(id=>b.revisions[id]!==active.get(id).revision))return error('Автор изменил вопросы. Обнови страницу и начни заново.',409);
    let modeName=null;if(b.modeId){const m=(await loadModes(env)).modes.find(m=>m.id===b.modeId&&m.enabled);const years=b.years;if(!Array.isArray(years)||!years.length||years.some(y=>!Number.isInteger(y)||y<2021||y>2026))return error('Проверь годы.');const pool=modePool(m,current,years);if(!m||ids.length!==modeCount(m,pool)||ids.some(id=>!pool.some(q=>q.id===id)))return error('Состав режима изменён. Обнови страницу.',409);modeName=m.name;}
+   const ranking=b.modeId?await prepareRanking(env,b.modeId,current):null;const eligible=ranking&&Array.isArray(b.years)&&new Set(b.years).size===6&&[2021,2022,2023,2024,2025,2026].every(y=>b.years.includes(y));
    const snapshot=ids.map(id=>active.get(id));const owner=guest(req)||crypto.randomUUID(),now=Date.now();const recent=await env.DB.prepare('SELECT COUNT(*) AS n FROM attempts WHERE owner=? AND started_at>?').bind(owner,now-3600000).first();if(recent.n>=20)return error('Слишком много попыток. Попробуй через час.',429);
    const id=crypto.randomUUID(),max=ids.reduce((s,id)=>s+active.get(id).level,0),years=[...new Set(ids.map(id=>active.get(id).year))].sort();
-   await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points,question_snapshot,mode_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max,JSON.stringify(snapshot),modeName).run();
+   await env.DB.prepare('INSERT INTO attempts (id,owner,nickname,started_at,updated_at,question_ids,answers,years,total,max_points,question_snapshot,mode_name,account_id,mode_id,board_key,public_consent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,nickname,now,now,JSON.stringify(ids),'{}',JSON.stringify(years),ids.length,max,JSON.stringify(snapshot),modeName,account.id,b.modeId||null,eligible?ranking.key:null,b.publicConsent===true?1:0).run();
    return json({id,startedAt:now},201,{'Set-Cookie':`tt_player=${owner}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`});
   }
   const match=/^\/api\/attempts\/([a-f0-9-]{36})$/.exec(p);
   if(match&&req.method==='PUT'){
-   const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=? AND owner=?').bind(match[1],guest(req)||'').first();if(!row)return error('Попытка не найдена в этом браузере.',404);
+   const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(match[1]).first();const account=await playerAccount(req,env);if(!row||(row.account_id?row.account_id!==account?.id:row.owner!==(guest(req)||'')))return error('Попытка не найдена в этом аккаунте или браузере.',404);if(row.deleted_at)return error('Автор удалил эту попытку из статистики.',410);
    const map=row.question_snapshot?new Map(JSON.parse(row.question_snapshot).map(q=>[q.id,q])):byId;const b=await body(req),ids=JSON.parse(row.question_ids),old=JSON.parse(row.answers),answers=b.answers;
    if(!answers||Array.isArray(answers)||typeof answers!=='object'||Object.keys(answers).some(id=>!ids.includes(id)))return error('Неверные ответы.');
    if(Object.entries(old).some(([id,a])=>answers[id]!==a))return error('Сохранённый ответ нельзя заменить.',409);
@@ -120,14 +167,16 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
   }
   if(p.startsWith('/api/admin')){
    if(!isAdmin)return error('Доступ только для администратора.',403);
+   const removing=/^\/api\/admin\/attempts\/([a-f0-9-]{36})(?:\/(restore|remove-player))?$/.exec(p);
+   if(removing&&(req.method==='DELETE'||req.method==='POST')){const row=await env.DB.prepare('SELECT * FROM attempts WHERE id=?').bind(removing[1]).first();if(!row)return error('Попытка не найдена.',404);if(req.method==='DELETE'&&!removing[2]){await env.DB.prepare('UPDATE attempts SET deleted_at=? WHERE id=?').bind(Date.now(),row.id).run();return json({ok:true});}if(req.method==='POST'&&removing[2]==='restore'){await env.DB.prepare('UPDATE attempts SET deleted_at=NULL WHERE id=?').bind(row.id).run();return json({ok:true});}if(req.method==='POST'&&removing[2]==='remove-player'){const result=await env.DB.prepare('UPDATE attempts SET deleted_at=? WHERE '+(row.account_id?'account_id=?':'owner=? AND account_id IS NULL')).bind(Date.now(),row.account_id||row.owner).run();return json({ok:true,removed:result.meta.changes});}return error('Метод не поддерживается.',405);}
    if(req.method!=='GET')return error('Метод не поддерживается.',405);
    if(p==='/api/admin/stats'){
-    const totals=await env.DB.prepare('SELECT COUNT(*) total, SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) finished, ROUND(AVG(CASE WHEN finished_at IS NOT NULL THEN percent END),1) average, COUNT(DISTINCT nickname) nicknames FROM attempts').first();
+    const totals=await env.DB.prepare('SELECT COUNT(*) total, SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) finished, ROUND(AVG(CASE WHEN finished_at IS NOT NULL THEN percent END),1) average, COUNT(DISTINCT nickname) nicknames FROM attempts WHERE deleted_at IS NULL').first();
     return json(totals);
    }
    if(p==='/api/admin/attempts'){
     const search=(url.searchParams.get('q')||'').trim().slice(0,40),state=url.searchParams.get('state'),offset=Math.max(0,Math.min(100000,Number(url.searchParams.get('offset'))||0));
-    const where=['nickname LIKE ?'];const args=['%'+search.replace(/[\\%_]/g,'\\$&')+'%'];where[0]+=" ESCAPE '\\'";
+    const where=['nickname LIKE ?',state==='deleted'?'deleted_at IS NOT NULL':'deleted_at IS NULL'];const args=['%'+search.replace(/[\\%_]/g,'\\$&')+'%'];where[0]+=" ESCAPE '\\'";
     if(state==='finished')where.push('finished_at IS NOT NULL');if(state==='active')where.push('finished_at IS NULL');
     const clause=where.join(' AND '),n=await env.DB.prepare('SELECT COUNT(*) n FROM attempts WHERE '+clause).bind(...args).first();
     const rows=await env.DB.prepare('SELECT * FROM attempts WHERE '+clause+' ORDER BY started_at DESC,id DESC LIMIT 30 OFFSET ?').bind(...args,offset).all();return json({items:rows.results.map(summary),total:n.n,offset});
@@ -138,11 +187,12 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
   return error('Не найдено.',404);
  }
  if(!['GET','HEAD'].includes(req.method))return error('Метод не поддерживается.',405);
+ if(p==='/admin/'&&assets['/admin.html'])return Response.redirect(new URL('/admin.html',req.url),302);
  let file=p==='/'?'/index.html':p==='/archive/'?'/archive/index.html':(p==='/admin'||p==='/admin/')?'/admin.html':p;try{file=decodeURIComponent(file);}catch{return error('Неверный адрес.',400);}const asset=assets[file];if(!asset)return new Response('Не найдено',{status:404});
  const bytes=Uint8Array.from(atob(asset[1]),c=>c.charCodeAt(0));return new Response(req.method==='HEAD'?null:bytes,{headers:{'Content-Type':asset[0],'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"}});
 }
 export default {async fetch(req,env){const origin=req.headers.get('origin'),allowed=origin===env.FRONTEND_ORIGIN;let response;
  if(req.method==='OPTIONS'){response=allowed?new Response(null,{status:204}):error('Источник не разрешён.',403);}else{try{response=await handle(req,env);}catch(e){console.error('Ошибка запроса',e?.message);response=error('Не удалось обработать запрос. Повтори позже.',500);}}
- if(allowed&&new URL(req.url).pathname.startsWith('/api/')){const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',origin);headers.set('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');headers.set('Access-Control-Allow-Headers','Content-Type,X-Player-Token,Authorization');headers.set('Vary','Origin');response=new Response(response.body,{status:response.status,headers});}return response;}};
+ if(allowed&&new URL(req.url).pathname.startsWith('/api/')){const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',origin);headers.set('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');headers.set('Access-Control-Allow-Headers','Content-Type,X-Player-Token,X-Account-Token,Authorization');headers.set('Vary','Origin');response=new Response(response.body,{status:response.status,headers});}return response;}};
 
 
