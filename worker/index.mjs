@@ -1,3 +1,4 @@
+import {loadAppearance,appearanceRoutes} from './appearance.mjs';
 import {playerRoutes,playerAccount,publicBoard,prepareRanking} from './players.mjs';
 const defaultModes=[
 {id:'quick',name:'Быстрый скролл',description:'Проверить, в теме ли ты.',count:18,selection:'all',questionIds:[],enabled:true},
@@ -9,7 +10,7 @@ function validateModes(modes,questions){if(!Array.isArray(modes)||!modes.length|
 
 async function loadModes(env){const row=await env.DB.prepare("SELECT * FROM settings WHERE key='modes'").first();return {modes:row?JSON.parse(row.data):defaultModes,revision:row?.revision||0};}
 async function modeRoutes(req,env,p,isAdmin){
- if(p==='/api/archive'&&req.method==='GET')return json({schemaVersion:1,questions:await loadQuestions(env),modes:(await loadModes(env)).modes.filter(m=>m.enabled)});
+ if(p==='/api/archive'&&req.method==='GET')return json({schemaVersion:1,questions:await loadQuestions(env),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
  if(p==='/api/modes'&&req.method==='GET'){const data=await loadModes(env);return json({...data,modes:data.modes.filter(m=>m.enabled)});}
  if(p!=='/api/admin/modes')return null;if(!isAdmin)return error('Доступ только для администратора.',403);
  if(req.method==='GET')return json(await loadModes(env));if(req.method!=='PUT')return error('Метод не поддерживается.',405);
@@ -32,7 +33,7 @@ function validateQuestion(input,id){if(!input||typeof input!=='object')throw Err
  return {id,topic:text('topic',160,true),prompt:text('prompt',1200,true),year:input.year,level:input.level,kind:text('kind',80)||'Знаток',options,answer,acceptedAnswers,explanation:text('explanation',4000,true),quote:text('quote',600),image:image||null,imageCredit:credit||null,sources:urls('sources'),media:urls('media')};}
 async function boundedBytes(req,limit){const reader=req.body?.getReader();if(!reader)return null;const chunks=[];let size=0;for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit){await reader.cancel();return null;}chunks.push(value);}const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}return bytes;}
 async function cmsRoutes(req,env,p,isAdmin){
- if(p==='/api/questions'&&req.method==='GET')return json({questions:await loadQuestions(env),modes:(await loadModes(env)).modes.filter(m=>m.enabled)});
+ if(p==='/api/questions'&&req.method==='GET')return json({questions:await loadQuestions(env),modes:(await loadModes(env)).modes.filter(m=>m.enabled),appearance:(await loadAppearance(env)).appearance});
  const media=/^\/api\/images\/([a-f0-9-]{36}\.(?:png|jpg|webp))$/.exec(p);if(media&&req.method==='GET'){if(!env.BUCKET)return error('Хранилище изображений недоступно.',503);const object=await env.BUCKET.get('quiz/'+media[1]);if(!object)return error('Изображение не найдено.',404);return new Response(object.body,{headers:{'Content-Type':object.httpMetadata?.contentType||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':'public, max-age=31536000, immutable'}});}
  if(!p.startsWith('/api/admin/questions')&&p!=='/api/admin/images')return null;
  if(!isAdmin)return error('Доступ только для администратора.',403);
@@ -93,6 +94,7 @@ export async function handle(req,env){const url=new URL(req.url),p=url.pathname;
   const player=await playerRoutes(req,env,p);if(player)return player;
   if(p==='/api/leaderboard'&&req.method==='GET')return await publicBoard(req,env);
   const auth=await authRoutes(req,env,p);if(auth)return auth;
+  const appearance=await appearanceRoutes(req,env,p,isAdmin);if(appearance)return appearance;
   const modes=await modeRoutes(req,env,p,isAdmin);if(modes)return modes;
   const cms=await cmsRoutes(req,env,p,isAdmin);if(cms)return cms;
   if(p==='/api/attempts'&&req.method==='POST'){
